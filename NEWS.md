@@ -4,6 +4,8 @@
 
 * `deepcopy` for NDArray (#273)
 
+* `scalar ./ NDArray` is available now. (#292)
+
 ## API Changes
 
 * `reshape` of NDArray share the same interface with Base (#272).
