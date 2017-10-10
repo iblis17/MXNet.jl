@@ -714,7 +714,7 @@ Matrix division (solving linear systems) is not implemented yet.
 """
     /(arg0 :: Real, arg :: NDArray)
 
-Elementwise Divide a scalar by an `NDArray`.
+Elementwise divide a scalar by an `NDArray`.
 """
 /(arg0 :: Real, arg :: NDArray) = div(arg0, arg)
 
