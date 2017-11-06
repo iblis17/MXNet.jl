@@ -46,6 +46,8 @@ function __init__()
   _get_libmx_op_names()
   _populate_iter_creator_cache!()
 
+  global const LIB_VERSION = _get_lib_version()
+
   atexit() do
     # notify libmxnet we are shutting down
     ccall( ("MXNotifyShutdown", MXNET_LIB), Cint, () )
@@ -72,6 +74,15 @@ macro mxcall(fv, argtypes, args...)
       throw(MXError(err_msg))
     end
   end
+end
+
+"""
+Get libmxnet version
+"""
+function _get_lib_version()
+  ver = Ref{Cint}(0)
+  @mxcall :MXGetVersion (Ref{Cint},) ver
+  ver[]
 end
 
 ################################################################################
@@ -146,14 +157,16 @@ end
 #
 # TODO: find a better solution in case this cause issues in the future.
 ################################################################################
-function dump_mx_param(val :: Any)
-  string(val)
-end
-function dump_mx_param{N,T<:Integer}(shape :: NTuple{N, T})
-  string(tuple(flipdim([shape...],1)...))
-end
+dump_mx_param(val::Any) = string(val)
+dump_mx_param(val::Float64) = @sprintf("%.16e", val)
+dump_mx_param(val::Float32) = @sprintf("%.8e", val)
+dump_mx_param(val::Float16) = @sprintf("%.4e", val)
+dump_mx_param{N, T<:Integer}(shape::NTuple{N, T}) =
+  string(tuple(flipdim([shape...], 1)...))
 
-"""A convenient macro copied from Mocha.jl that could be used to define structs
+
+"""
+A convenient macro copied from Mocha.jl that could be used to define structs
 with default values and type checks. For example
 ```julia
 @defstruct MyStruct Any (

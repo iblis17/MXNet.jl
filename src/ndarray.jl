@@ -99,7 +99,8 @@ type NDArray
 end
 
 function Base.show(io :: IO, arr :: NDArray)
-  print(io, "mx.NDArray{$(eltype(arr))}$(size(arr))")
+  println(io, "$(join(size(arr), "×")) mx.NDArray{$(eltype(arr))} @ $(context(arr)):")
+  Base.showarray(io, try_get_shared(arr, sync=:read), false, header=false)
 end
 
 function NDArray{T<:Real}(data :: Array{T})
@@ -299,7 +300,7 @@ function eltype{T <: Union{NDArray, MX_NDArrayHandle}}(arr :: T)
 
   if dtype_ref[] == -1 # arr->is_none()
     warn("Eltype of $arr is not defined")
-    Base.show_backtrace(STDOUT,backtrace())
+    Base.show_backtrace(STDOUT, backtrace())
     println()
     return Float32
   else
@@ -720,6 +721,31 @@ Elementwise divide a scalar by an `NDArray`.
 
 
 """
+    fill!(x, arr::NDArray)
+
+Create an `NDArray` filled with the value `x`, like `Base.fill`.
+"""
+function fill!(x, arr::NDArray)
+  arr[:] = x
+  arr
+end
+
+"""
+    fill(x, dims, ctx=cpu())
+    fill(x, dims...)
+
+Create an `NDArray` filled with the value `x`, like `Base.fill`.
+"""
+function fill{N}(x, dims::NTuple{N, Integer}, ctx::Context=cpu())
+  arr = empty(typeof(x), dims, ctx)
+  arr[:] = x
+  arr
+end
+
+fill(x, dims::Integer...) = fill(x, dims)
+
+
+"""
 Manipulating as Julia Arrays
 ----------------------------
 
@@ -849,24 +875,35 @@ function _wait_to_write(arr :: NDArray)
 end
 
 """
-    try_get_shared(arr)
+    try_get_shared(arr; sync=:nop)
 
 Try to create a Julia array by sharing the data with the underlying `NDArray`.
 
 # Arguments:
+
 * `arr::NDArray`: the array to be shared.
 
 !!! note
     The returned array does not guarantee to share data with the underlying `NDArray`.
     In particular, data sharing is possible only when the `NDArray` lives on CPU.
+
+* `sync::Symbol`: `:nop`,`:write`, `:read`
+  On CPU, invoke `_wait_to_read` if `:read`;
+  invoke `_wait_to_write` if `:write`.
 """
-function try_get_shared(arr :: NDArray)
+function try_get_shared(arr :: NDArray; sync::Symbol=:nop)
   if context(arr).device_type == CPU
     # try to do data sharing
-    return unsafe_wrap(Array, pointer(arr), size(arr))
+    if sync == :read
+      _wait_to_read(arr)
+    elseif sync == :write
+      _wait_to_write(arr)
+    end
+
+    unsafe_wrap(Array, pointer(arr), size(arr))
   else
     # impossible to share, just copying
-    return copy(arr)
+    copy(arr)
   end
 end
 
@@ -876,12 +913,12 @@ end
 Test whether `j_arr` is sharing data with `arr`.
 
 # Arguments:
-* Array j_arr: the Julia Array.
-* NDArray arr: the `NDArray`.
+
+* `j_arr::Array`: the Julia Array.
+* `arr::NDArray`: the `NDArray`.
 """
-function is_shared(j_arr :: Array, arr :: NDArray)
-  false
-end
+is_shared(j_arr :: Array, arr :: NDArray) = false
+
 function is_shared{T<:DType}(j_arr :: Array{T}, arr :: NDArray)
   if length(j_arr) != length(arr)
     return false
@@ -951,30 +988,105 @@ function save(filename::String, data::Dict{Base.Symbol,NDArray})
           filename, length(names), arrays, names)
 end
 
-import Base: reshape
+################################################################################
+# Mapping NDArray functions to Base-like API
+################################################################################
 
-"""
-    reshape(arr::NDArray, dim...; reverse=false)
-    reshape(arr::NDArray, dim; reverse=false)
-"""
-reshape{N}(arr::NDArray, dim::NTuple{N, Integer}; reverse::Bool=false) =
-    _reshape(arr, dim, reverse)
-reshape{N}(arr::NDArray, dim::Vararg{Integer, N}; reverse::Bool=false) =
-    _reshape(arr, dim, reverse)
+const _mxsig = Dict{Symbol,Expr}()
 
-@inline function _reshape{N}(arr::NDArray, dim::NTuple{N, Integer}, reverse::Bool)
-  op_handle = _get_cached_libmx_op_handle("reshape")
-  n_output = Ref(Cint(0))
-  hdls_ref = Ref{Ptr{MX_handle}}(C_NULL)
-  @mxcall(:MXImperativeInvoke,
-          (MX_handle, Cint, Ptr{MX_handle}, Ref{Cint}, Ref{Ptr{MX_handle}},
-           Cint, char_pp, char_pp),
-          op_handle, 1, [arr.handle], n_output, hdls_ref,
-          2, ["shape", "reverse"], [dump_mx_param(dim), dump_mx_param(!reverse)])
-  #                                                       not a typo  ^^^^^^^^
-  @assert n_output[] == 1
-  NDArray(MX_NDArrayHandle(unsafe_load(hdls_ref[], 1)))
+function _autoimport(name::Symbol)
+  if isdefined(Base, name)
+    :(import Base: $name)
+  else
+    :()
+  end
 end
+
+macro _remap(sig::Expr, imp::Expr)
+  fname = sig.args[1]
+  opname = string(imp.args[1])
+
+  import_expr = _autoimport(fname)
+
+  if isa(imp.args[2], Expr) && imp.args[2].head == :parameters
+    ndin = imp.args[3:end]
+    mxargs = imp.args[2].args
+  else  # no keyword arguments
+    ndin = imp.args[2:end]
+    mxargs = []
+  end
+
+  mxkeys = map(x -> string(x.args[1]), mxargs)
+  mxvals = Expr(:vect, map(x -> :(dump_mx_param($(x.args[2]))), mxargs)...)
+  ndhlds = Expr(:vect, map(x -> :($(x).handle), ndin)...)
+
+  func_body = quote
+    op_handle = _get_cached_libmx_op_handle($opname)
+    n_output = Ref(Cint(0))
+    hdls_ref = Ref{Ptr{MX_handle}}(C_NULL)
+    @mxcall(:MXImperativeInvoke,
+            (MX_handle,
+             Cint,
+             Ptr{MX_handle},
+             Ref{Cint},
+             Ref{Ptr{MX_handle}},
+             Cint,
+             char_pp,
+             char_pp),
+            op_handle,
+            $(length(ndin)),
+            $(ndhlds),
+            n_output,
+            hdls_ref,
+            $(length(mxargs)),
+            $mxkeys,
+            $mxvals)
+    NDArray(MX_NDArrayHandle(unsafe_load(hdls_ref[], 1)))
+  end
+
+  docstr = "    $sig"
+  func_def = Expr(:function, sig, func_body)
+
+  esc(quote
+    $import_expr
+    @doc $docstr ->
+    $func_def
+  end)
+end
+
+macro _remap(sig::Expr, imp::Symbol)
+  imp = _mxsig[imp]
+
+  esc(quote
+    @_remap($sig, $imp)
+  end)
+end
+
+_mxsig[:reshape] = :(reshape(arr; shape = dim, reverse = !reverse))
+@_remap reshape(arr::NDArray, dim...; reverse = false) reshape
+@_remap reshape(arr::NDArray, dim; reverse = false)    reshape
+
+@_remap mean(arr::NDArray)         mean(arr)
+@_remap mean(arr::NDArray, region) mean(arr; axis = 0 .- region, keepdims = true)
+
+@_remap sum(arr::NDArray)       sum(arr)
+@_remap sum(arr::NDArray, dims) sum(arr; axis = 0 .- dims, keepdims = true)
+
+@_remap maximum(arr::NDArray)       max(arr)
+@_remap maximum(arr::NDArray, dims) max(arr; axis = 0 .- dims, keepdims = true)
+
+@_remap minimum(arr::NDArray)       min(arr)
+@_remap minimum(arr::NDArray, dims) min(arr; axis = 0 .- dims, keepdims = true)
+
+# See https://github.com/dmlc/MXNet.jl/issues/55
+@_remap dot(x::NDArray, y::NDArray) dot(y, x)
+
+# See https://github.com/dmlc/MXNet.jl/pull/123
+@_remap transpose(arr::NDArray) transpose(_only2d(arr))
+@_remap permutedims(arr::NDArray, axes) transpose(arr; axes = length(axes) .- tuple(axes...))
+
+@_remap prod(arr::NDArray)       prod(arr)
+@_remap prod(arr::NDArray, dims) prod(arr; axis = 0 .- dims, keepdims = true)
 
 ################################################################################
 # NDArray functions dynamically imported from libmxnet
@@ -991,19 +1103,6 @@ end
   NDARRAY_ARG_BEFORE_SCALAR = 1,
   ACCEPT_EMPTY_MUTATE_TARGET = (1 << 2)
 )
-
-function _julia_to_mx_param(val :: Any)
-  string(val)
-end
-function _julia_to_mx_param(val :: Float64)
-  @sprintf("%.16e", val)
-end
-function _julia_to_mx_param(val :: Float32)
-  @sprintf("%.8e", val)
-end
-function _julia_to_mx_param(val :: Float16)
-  @sprintf("%.4e", val)
-end
 
 # Import corresponding math functions from base so the automatically defined libmxnet
 # functions can overload them
@@ -1056,19 +1155,6 @@ function _get_ndarray_function_def(name :: String)
         args = MX_handle[]
       end
 
-      # XXX: hacky way of solving the problem that the arguments of `dot` should be swapped
-      # See https://github.com/dmlc/MXNet.jl/issues/55
-      if $name == "dot"
-        args = reverse(args)
-      end
-
-      # XXX: hacky way of solving the semantic difference of the axes parameter in Julia
-      # and in libmxnet.
-      # See https://github.com/dmlc/MXNet.jl/pull/123
-      if $name == "transpose"
-        kwargs = Any[key != :axes ? (key, arg) : (key, reverse(map(i->length(arg)-i, arg))) for (key, arg) in kwargs]
-      end
-
       if length(output_vars) > 0
         output_handles = map((x) -> Base.cconvert(MX_handle, x), output_vars)
         # XXX: Julia 0.4 has bug: [Array{MX_handle}] == Array{MX_handle}
@@ -1080,7 +1166,7 @@ function _get_ndarray_function_def(name :: String)
       num_outputs_p = [convert(Cint, num_outputs)]
 
       kw_keys_str = String[string(x[1]) for x in kwargs]
-      kw_vals_str = String[_julia_to_mx_param(x[2]) for x in kwargs]
+      kw_vals_str = String[dump_mx_param(x[2]) for x in kwargs]
 
       #op_handle = _get_cached_libmx_op_handle($(QuoteNode(name)))
       op_handle = _get_cached_libmx_op_handle($(name))
@@ -1116,9 +1202,21 @@ function _get_ndarray_function_def(name :: String)
   return func_def, func_def2
 end
 
+const _op_import_bl = [  # import black list; do not import these funcs
+    "mean",
+    "reshape",
+    "sum",
+    "max",
+    "max_axis",
+    "min",
+    "min_axis",
+    "dot",
+    "transpose",
+    "prod",
+]
+
 macro _import_ndarray_functions()
-  black_list = ["reshape"]  # do not import these funcs
-  names = filter(n -> ∉(lowercase(n), black_list), _get_libmx_op_names())
+  names = filter(n -> ∉(lowercase(n), _op_import_bl), _get_libmx_op_names())
 
   func_exprs = map(names) do name
     op_handle = _get_libmx_op_handle(name)
